@@ -1,7 +1,8 @@
 #!/bin/bash
 
 # Define the SSH port
-PORT=10167
+PORT=252
+PORTSPOOF_PORT=4444
 
 # Global variable to hold the detected OS
 DETECTED_OS=""
@@ -24,46 +25,135 @@ parse_arguments() {
     done
 }
 
+save_iptables_rules() {
+    local filename="$1"
+    if [ -z "$filename" ]; then
+        echo "Error: Filename is required."
+        return 1
+    fi
+
+    if ! sudo iptables-save | sudo tee "$filename" > /dev/null; then
+        echo "Error: Failed to save iptables rules to '$filename'."
+        return 2
+    else
+        echo "Iptables rules have been successfully saved to '$filename'."
+    fi
+}
+
+restore_iptables_rules() {
+    # Define the filename from which the iptables rules will be restored.
+    local filename="$1"
+
+    # Check if the filename is provided.
+    if [ -z "$filename" ]; then
+        echo "Error: Filename is required."
+        return 1
+    fi
+
+    # Check if the file exists.
+    if [ ! -f "$filename" ]; then
+        echo "Error: File '$filename' does not exist."
+        return 2
+    fi
+
+    # Use iptables-restore to load the iptables rules from the specified file.
+    if sudo iptables-restore < "$filename"; then
+        echo "Iptables rules have been successfully restored from '$filename'."
+    else
+        echo "Error: Failed to restore iptables rules from '$filename'."
+        return 3
+    fi
+}
+
 # Flush existing iptables rules and set default policies
 reset_firewall() {
     echo "Resetting firewall rules..."
-    iptables -F
-    iptables -X
-    iptables -t nat -F
-    iptables -t nat -X
-    iptables -t mangle -F
-    iptables -t mangle -X
-    iptables -P INPUT ACCEPT
-    iptables -P FORWARD ACCEPT
-    iptables -P OUTPUT ACCEPT
+
+    # Attempt to flush and reset iptables rules, capturing any errors
+    if ! iptables -F || ! iptables -X || \
+       ! iptables -t nat -F || ! iptables -t nat -X || \
+       ! iptables -t mangle -F || ! iptables -t mangle -X || \
+       ! iptables -P INPUT ACCEPT || ! iptables -P FORWARD ACCEPT || ! iptables -P OUTPUT ACCEPT; then
+        echo "Error occurred while resetting firewall rules."
+        return 1 # Indicate failure
+    fi
+
+    echo "Firewall rules have been reset successfully."
 }
 
-# Block all incoming traffic except on the designated SSH port
 block_all_incoming() {
     echo "Blocking all incoming traffic except on port $PORT..."
-    iptables -P INPUT DROP
-    iptables -A INPUT -i lo -j ACCEPT
-    iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-    iptables -A INPUT -p tcp --dport $PORT -j ACCEPT
-    iptables -A INPUT -p icmp -j ACCEPT
+
+    # Apply iptables rules, checking the success of each command
+    if ! iptables -P INPUT DROP || \
+       ! iptables -A INPUT -i lo -j ACCEPT || \
+       ! iptables -A INPUT -p tcp --dport "$PORT" -j ACCEPT || \
+       ! iptables -A INPUT -p tcp --dport "$PORTSPOOF_PORT" -j ACCEPT || \
+       ! iptables -A INPUT -p udp --dport "$PORTSPOOF_PORT" -j ACCEPT || \
+       ! iptables -A INPUT -p icmp -j ACCEPT; then
+        echo "Error occurred while setting up iptables rules."
+        return 1 # Indicate failure
+    fi
+
+    echo "All incoming traffic except on designated ports has been blocked successfully."
 }
+
+portspoof_all_iptables_rules() {
+    echo "Enabling portspoof iptables rules..."
+
+    # Apply iptables rules, checking the success of each command
+    if ! iptables -t nat -A PREROUTING -i "$INTERFACE" -p tcp -m tcp --dport 1:$((PORT-1)) -j REDIRECT --to-ports 4444 || \
+       ! iptables -t nat -A PREROUTING -i "$INTERFACE" -p tcp -m tcp --dport $((PORT+1)):65535 -j REDIRECT --to-ports 4444; then
+        echo "Error occurred while setting up portspoof iptables rules."
+        return 1 # Indicate failure
+    fi
+
+    echo "Portspoof iptables rules have been enabled successfully."
+}
+
+# Block all outgoing traffic except traffic to package managers
+block_outgoing_ex_pkgs() {
+    echo "Configuring outgoing firewall rules to allow only package management traffic..."
+
+    # Apply iptables rules, checking the success of each command
+    if ! iptables -F OUTPUT || \
+       ! iptables -P OUTPUT DROP || \
+       ! iptables -A OUTPUT -o lo -j ACCEPT || \
+       ! iptables -A OUTPUT -p udp --dport 53 -j ACCEPT || \
+       ! iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT || \
+       ! iptables -A OUTPUT -p tcp --dport 80 -j ACCEPT || \
+       ! iptables -A OUTPUT -p tcp --dport 443 -j ACCEPT || \
+       ! iptables -A OUTPUT -m state --state RELATED -j ACCEPT; then
+        echo "Error occurred while setting up outgoing iptables rules."
+        return 1 # Indicate failure
+    fi
+
+    echo "Outgoing rules configured successfully to allow package updates and essential services."
+}
+
 
 # Allow outgoing traffic only for connections established through the designated port
-allow_outgoing_for_designated_port() {
+block_outgoing_ex_designated() {
     echo "Allowing outgoing traffic only for connections established through port $PORT..."
-    # Mark packets related to SSH connections
-    iptables -t mangle -A OUTPUT -p tcp --sport $PORT -j MARK --set-mark 1
-    # Allow marked traffic and essential services
-    iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-    iptables -A OUTPUT -m mark --mark 1 -j ACCEPT
-    iptables -A OUTPUT -o lo -j ACCEPT
-    iptables -P OUTPUT DROP  # Drop all other outgoing traffic
-}
 
-# Drop all existing connections to ensure a clean state
-drop_all_connections() {
-    echo "Dropping all existing connections..."
-    conntrack -F
+    # Mark packets related to SSH connections
+    # TODO: Add outgoing to local network machines to ports 22 and 3389
+    # iptables -I OUTPUT 1 -d 10.100.19.4 -j ACCEPT
+    if ! iptables -t mangle -A OUTPUT -p tcp --sport "$PORT" -j MARK --set-mark 1 || \
+       ! iptables -t mangle -A OUTPUT -p tcp --sport "$PORTSPOOF_PORT" -j MARK --set-mark 1 || \
+       ! iptables -t mangle -A OUTPUT -p udp --sport "$PORTSPOOF_PORT" -j MARK --set-mark 1; then
+        echo "Error occurred while marking outgoing packets."
+        return 1 # Indicate failure
+    fi
+
+    # Allow marked traffic and essential services
+    if ! iptables -A OUTPUT -m conntrack --ctstate RELATED -j ACCEPT || \
+       ! iptables -A OUTPUT -m mark --mark 1 -j ACCEPT || \
+       ! iptables -A OUTPUT -o lo -j ACCEPT || \
+       ! iptables -P OUTPUT DROP; then
+        echo "Error occurred while setting up outgoing iptables rules."
+        return 1 # Indicate failure
+    fi
 }
 
 # Function to detect the current system type
@@ -85,6 +175,7 @@ detect_system_type() {
     else
         echo "OS not detected."
         DETECTED_OS="unknown"
+        return 1
     fi
 
     # Normalize OS name to lowercase
@@ -129,8 +220,10 @@ install_gpp_if_missing() {
         *)
             if [ "$DETECTED_OS" = "unknown" ]; then
                 echo "Unsupported or unknown OS. Cannot install g++."
+                return 1
             else
                 echo "g++ is already installed or OS is unsupported for automatic installation."
+                return 1
             fi
             ;;
     esac
@@ -223,8 +316,10 @@ install_git_if_missing() {
         *)
             if [ "$DETECTED_OS" = "unknown" ]; then
                 echo "Unsupported or unknown OS. Cannot install git automatically."
+                return 1
             else
                 echo "git installation not required or OS is unsupported for automatic installation."
+                return 1
             fi
             ;;
     esac
@@ -270,52 +365,10 @@ install_make_if_missing() {
         *)
             if [ "$DETECTED_OS" = "unknown" ]; then
                 echo "Unsupported or unknown OS. Cannot install make automatically."
+                return 1
             else
                 echo "make installation not required or OS is unsupported for automatic installation."
-            fi
-            ;;
-    esac
-}
-
-install_conntrack_if_missing() {
-    case "$DETECTED_OS" in
-        ubuntu|debian)
-            if ! command -v conntrack >/dev/null 2>&1; then
-                echo "conntrack not found. Installing conntrack..."
-                sudo apt-get update && sudo apt-get install -y conntrack
-            else
-                echo "conntrack is already installed."
-            fi
-            ;;
-        centos|fedora|"red hat")
-            if ! command -v conntrack >/dev/null 2>&1; then
-                echo "conntrack not found. Installing conntrack..."
-                sudo yum install -y conntrack-tools
-            else
-                echo "conntrack is already installed."
-            fi
-            ;;
-        suse|opensuse*)
-            if ! command -v conntrack >/dev/null 2>&1; then
-                echo "conntrack not found. Installing conntrack..."
-                sudo zypper install -y conntrack-tools
-            else
-                echo "conntrack is already installed."
-            fi
-            ;;
-        alpine)
-            if ! command -v conntrack >/dev/null 2>&1; then
-                echo "conntrack not found. Installing conntrack..."
-                sudo apk add --update conntrack-tools
-            else
-                echo "conntrack is already installed."
-            fi
-            ;;
-        *)
-            if [ "$DETECTED_OS" = "unknown" ]; then
-                echo "Unsupported or unknown OS. Cannot install conntrack."
-            else
-                echo "conntrack is already installed or OS is unsupported for automatic installation."
+                return 1
             fi
             ;;
     esac
@@ -334,42 +387,30 @@ detect_main_interface() {
 }
 
 change_sshd_port_and_restart() {
-
-    # Ensure PORT variable is not empty and is a number
     if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
         echo "Invalid port: $PORT"
         return 1
     fi
 
-    # Call the OS detection function
     detect_system_type
 
-    # Common path for sshd_config
-    SSHD_CONFIG_PATH="/etc/ssh/sshd_config"
-
-    # Update sshd_config to listen on the new port
+    local SSHD_CONFIG_PATH="/etc/ssh/sshd_config"
     if [ -f "$SSHD_CONFIG_PATH" ]; then
-        # Backup the original sshd_config file
         cp "$SSHD_CONFIG_PATH" "${SSHD_CONFIG_PATH}.bak"
-
-        # Comment out the existing Port line(s) and set the new port
         sed -i 's/^Port /#&/' "$SSHD_CONFIG_PATH"
         echo "Port $PORT" >> "$SSHD_CONFIG_PATH"
 
-        # Restart sshd service based on the detected OS
         case "$DETECTED_OS" in
             ubuntu|debian|alpine)
-                if command -v systemctl >/dev/null 2>&1; then
-                    systemctl restart sshd
-                else
-                    service sshd restart
+                if ! (sudo systemctl restart sshd || sudo service sshd restart); then
+                    echo "Failed to restart sshd."
+                    return 1
                 fi
                 ;;
             centos|"red hat"|"red hat enterprise linux"|fedora|suse|"opensuse leap")
-                if command -v systemctl >/dev/null 2>&1; then
-                    systemctl restart sshd
-                else
-                    service ssh restart
+                if ! (sudo systemctl restart sshd || sudo service ssh restart); then
+                    echo "Failed to restart sshd."
+                    return 1
                 fi
                 ;;
             *)
@@ -387,56 +428,161 @@ change_sshd_port_and_restart() {
 # Main function to apply configurations
 main() {
 
-    # Parse the command-line arguments
+    # =================( Parse command-line arguments )=================
     parse_arguments "$@"
 
-    detect_system_type
 
-    # Firewall out attackers
-    install_iptables_if_missing
-    reset_firewall
-    block_all_incoming
+    # =================( Detect system type )=================
+    if ! detect_system_type; then
+        echo "Error: Failed to detect system type."
+        return 1
+    fi
+
+    # Prevent interactive service restart
+    sed -i "/#\$nrconf{restart} = 'i';/s/.*/\$nrconf{restart} = 'a';/" /etc/needrestart/needrestart.conf
+
+    # ===========( Create working directory )==========
+    WORKING_DIR="$(pwd)/.spooky"
+
+    if ! mkdir -p "$WORKING_DIR"; then
+        echo "Error: Failed to create working directory."
+        return 1
+    fi
+
+    if ! cd "$WORKING_DIR"; then
+        echo "Error: Failed to change to working directory."
+        return 1
+    fi
+
+    # ===========( Save iptables configuration )==========
+    OLD_IPTABLES_RULES="$(pwd)/old_iptables_rules"
+
+    if ! install_iptables_if_missing; then
+        echo "Error: Failed to install iptables."
+        return 1
+    fi
+
+    if ! save_iptables_rules "$OLD_IPTABLES_RULES"; then
+        echo "Error: Failed to save iptables rules."
+        return 1
+    fi
+
+    # ==========( Firewall out attackers )==========
+    if ! reset_firewall; then
+        echo "Error: Failed to reset firewall."
+        return 1
+    fi
+
+    if ! block_all_incoming; then
+        echo "Error: Failed to block all incoming traffic."
+        return 1
+    fi
+    
+    if ! block_outgoing_ex_pkgs; then
+        echo "Error: Failed to block all outgoing traffic except traffic to package managers."
+        return 1
+    fi
+
     echo "Firewalled out attackers"
 
-    # Kill all established connections    
-    install_conntrack_if_missing
-    drop_all_connections
-    echo "Killed all connections"
+    # ==========( Download packages )===========
+    if ! install_gpp_if_missing; then
+        echo "Error: Failed to install g++."
+        return 1
+    fi
 
-    # Download packages
-    install_gpp_if_missing
-    install_make_if_missing
-    install_git_if_missing
+    if ! install_make_if_missing; then
+        echo "Error: Failed to install make."
+        return 1
+    fi
+
+    if ! install_git_if_missing; then
+        echo "Error: Failed to install git."
+        return 1
+    fi
+
     echo "Finished downloading all portspoof dependencies"
 
-    # Get portspoof
-    cd ~
-    mkdir ./.spooky
-    cd ./.spooky/
-    git clone https://github.com/drk1wi/portspoof.git
-    cd ./portspoof
-    ./configure
-    make
-    make install
+    # ==========( Install portspoof )===========
+    if ! git clone "https://github.com/drk1wi/portspoof.git"; then
+        echo "Error: Failed to clone portspoof repository."
+        return 1
+    fi
+
+    if ! cd ./portspoof; then
+        echo "Error: Failed to change to portspoof directory."
+        return 1
+    fi
+
+    if ! ./configure; then
+        echo "Error: Failed to configure portspoof."
+        return 1
+    fi
+
+    if ! make; then
+        echo "Error: Failed to make portspoof."
+        return 1
+    fi
+
+    if ! make install; then
+        echo "Error: Failed to install portspoof."
+        return 1
+    fi
+
     echo "Port Spoof installed sucessfully."
 
-    # Enable portspoof
-    detect_main_interface
-    reset_firewall
-    iptables -t nat -A PREROUTING -i $INTERFACE -p tcp -m tcp --dport 1:$PORT,$PORT:65535 -j REDIRECT --to-ports 4444
-    block_all_incoming
-    drop_all_connections
-    portspoof -c ./tools/portspoof.conf -s ./tools/portspoof.conf -D
+    # ==========( Enable portspoof )===========
+    if ! detect_main_interface; then
+        echo "Error: Failed to detect main interface."
+        return 1
+    fi
+
+    if ! reset_firewall; then
+        echo "Error: Failed to reset firewall."
+        return 1
+    fi
+
+    if ! block_all_incoming; then
+        echo "Error: Failed to block all incoming traffic."
+        return 1
+    fi
+
+    if ! portspoof_all_iptables_rules; then
+        echo "Error: Failed to enable portspoof iptables rules."
+        return 1
+    fi
+
+    # =================(  Re-enable outgoing firewall )=================
+    if ! block_outgoing_ex_designated; then
+        echo "Error: Failed to block all outgoing traffic except traffic to package managers."
+        return 1
+    fi
+
+    # =================( Create OpenSSH only signature file )=================
+    OPENSSH_SIGS_FILE="$(pwd)/tools/openssh_signatures"
+    if ! grep "OpenSSH" "$(pwd)/tools/portspoof_signatures" > "$OPENSSH_SIGS_FILE"; then
+        echo "Error: Failed to create OpenSSH signatures file."
+        return 1
+    fi
+
+    # =================( Start portspoof )=================
+    if ! portspoof -c ./tools/portspoof.conf -s "$OPENSSH_SIGS_FILE" -D; then
+        echo "Error: Failed to start portspoof."
+        return 1
+    fi
+
     echo "Successfully enabled Port Spoof."
 
-    # Prevent all outgoing connections except for out special port
-    allow_outgoing_for_designated_port
-    drop_all_connections
-    echo "Network configurations applied successfully."
-
-    # Start SSH on new Port
-    change_sshd_port_and_restart
+    # =================( Change SSH port )=================
+    if ! change_sshd_port_and_restart; then
+        echo "Error: Failed to change SSH port."
+        return 1
+    fi
 }
 
 # Execute main function with root privileges
-main "$@"
+if ! main "$@"; then
+    echo "An error occurred. Exiting."
+    restore_iptables_rules "$OLD_IPTABLES_RULES"
+    exit 1
+fi
